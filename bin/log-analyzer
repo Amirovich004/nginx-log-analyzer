@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: log-analyzer <logfile> [options]
+
+Analyze an nginx access log in combined format and print a summary.
+
+Options:
+  --top N        Show the N busiest clients (default: 10)
+  --format FMT   Output format: text (default) or json
+  -h, --help     Show this help
+
+Exit codes:
+  0  success
+  1  log file missing, unreadable, or without valid entries
+  2  invalid usage
+EOF
+}
+
+logfile=""
+top=10
+format="text"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --top|--format)
+      opt="$1"
+      if [ $# -lt 2 ]; then
+        printf 'error: %s requires a value\n' "$opt" >&2
+        exit 2
+      fi
+      if [ "$opt" = "--top" ]; then
+        top="$2"
+      else
+        format="$2"
+      fi
+      shift 2
+      ;;
+    -*)
+      printf 'error: unknown option: %s\n' "$1" >&2
+      printf 'try --help\n' >&2
+      exit 2
+      ;;
+    *)
+      if [ -n "$logfile" ]; then
+        printf 'error: only one log file can be analyzed at a time\n' >&2
+        exit 2
+      fi
+      logfile="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$logfile" ]; then
+  printf 'error: log file is required\n' >&2
+  usage >&2
+  exit 2
+fi
+
+case "$top" in
+  ''|*[!0-9]*)
+    printf 'error: --top must be a positive integer\n' >&2
+    exit 2
+    ;;
+esac
+
+if [ "$top" -lt 1 ]; then
+  printf 'error: --top must be a positive integer\n' >&2
+  exit 2
+fi
+
+case "$format" in
+  text|json) ;;
+  *)
+    printf "error: --format must be 'text' or 'json'\n" >&2
+    exit 2
+    ;;
+esac
+
+if [ ! -f "$logfile" ]; then
+  printf 'error: %s is not a file\n' "$logfile" >&2
+  exit 1
+fi
+
+if [ ! -r "$logfile" ]; then
+  printf 'error: %s is not readable\n' "$logfile" >&2
+  exit 1
+fi
+
+if [ ! -s "$logfile" ]; then
+  printf 'error: %s is empty\n' "$logfile" >&2
+  exit 1
+fi
+
+awk -v top="$top" -v format="$format" -v file="$logfile" '
+BEGIN {
+  split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", name, " ")
+  for (i = 1; i <= 12; i++) month[name[i]] = i
+}
+
+{
+  status = ""
+  for (i = 5; i <= NF; i++) {
+    if ($i ~ /^[1-5][0-9][0-9]$/) {
+      status = $i
+      break
+    }
+  }
+  if (status == "") {
+    skipped++
+    next
+  }
+
+  total++
+  clients[$1]++
+  classes[substr(status, 1, 1) "xx"]++
+
+  if ($4 ~ /^\[[0-9][0-9]\// && substr($4, 5, 3) in month) {
+    minute = sprintf("%s-%02d-%sT%s", substr($4, 9, 4), month[substr($4, 5, 3)], substr($4, 2, 2), substr($4, 14, 5))
+    perminute[minute]++
+  }
+}
+
+END {
+  if (total == 0) {
+    printf "error: no valid log entries in %s\n", file > "/dev/stderr"
+    exit 1
+  }
+
+  if (skipped) printf "warning: skipped %d malformed lines\n", skipped > "/dev/stderr"
+
+  errors = classes["4xx"] + classes["5xx"]
+  rate = errors * 100 / total
+
+  n = 0
+  for (ip in clients) order[++n] = ip
+
+  for (i = 1; i <= n; i++) {
+    best = i
+    for (j = i + 1; j <= n; j++) {
+      if (clients[order[j]] > clients[order[best]] ||
+          (clients[order[j]] == clients[order[best]] && order[j] < order[best])) {
+        best = j
+      }
+    }
+    swap = order[i]; order[i] = order[best]; order[best] = swap
+  }
+
+  limit = (top < n) ? top : n
+
+  peakminute = ""
+  peakcount = 0
+  for (m in perminute) {
+    if (perminute[m] > peakcount || (perminute[m] == peakcount && m < peakminute)) {
+      peakcount = perminute[m]
+      peakminute = m
+    }
+  }
+
+  if (format == "json") {
+    printf "{\n"
+    printf "  \"file\": \"%s\",\n", file
+    printf "  \"total_requests\": %d,\n", total
+    printf "  \"unique_clients\": %d,\n", n
+    printf "  \"error_rate_percent\": %.1f,\n", rate
+    printf "  \"status_classes\": {\"2xx\": %d, \"3xx\": %d, \"4xx\": %d, \"5xx\": %d},\n", classes["2xx"], classes["3xx"], classes["4xx"], classes["5xx"]
+    printf "  \"top_clients\": ["
+    for (i = 1; i <= limit; i++) {
+      printf "%s{\"ip\": \"%s\", \"requests\": %d}", (i > 1 ? ", " : ""), order[i], clients[order[i]]
+    }
+    printf "],\n"
+    if (peakminute == "") {
+      printf "  \"busiest_minute\": null\n"
+    } else {
+      printf "  \"busiest_minute\": {\"minute\": \"%s\", \"requests\": %d}\n", peakminute, peakcount
+    }
+    printf "}\n"
+  } else {
+    printf "File: %s\n", file
+    printf "Requests: %d\n", total
+    printf "Unique clients: %d\n", n
+    printf "Error rate: %.1f%% (%d of %d)\n", rate, errors, total
+    printf "\nStatus classes:\n"
+    printf "  2xx: %d\n", classes["2xx"]
+    printf "  3xx: %d\n", classes["3xx"]
+    printf "  4xx: %d\n", classes["4xx"]
+    printf "  5xx: %d\n", classes["5xx"]
+    printf "\nTop clients:\n"
+    for (i = 1; i <= limit; i++) {
+      printf "  %s: %d\n", order[i], clients[order[i]]
+    }
+    printf "\n"
+    if (peakminute == "") {
+      printf "Busiest minute: unknown (0 requests)\n"
+    } else {
+      printf "Busiest minute: %s (%d request%s)\n", peakminute, peakcount, (peakcount == 1 ? "" : "s")
+    }
+  }
+}
+' "$logfile"
