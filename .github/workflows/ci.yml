@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Lint scripts
+        run: shellcheck bin/log-analyzer tests/run-tests.sh
+
+  tests:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: bash tests/run-tests.sh
+
+  docker:
+    name: Docker smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t nginx-log-analyzer:ci .
+      - name: Analyze the fixture inside the container
+        run: |
+          docker run --rm -v "$PWD/tests/fixtures:/logs:ro" nginx-log-analyzer:ci /logs/sample.log --format json > report.json
+          python3 -c "import json; d = json.load(open('report.json')); assert d['total_requests'] == 20, d; assert d['unique_clients'] == 8, d; print('container report OK')"
